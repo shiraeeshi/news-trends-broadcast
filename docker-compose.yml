@@ -1,0 +1,20 @@
+version: '3.5'
+services:
+    rss-listener:
+        image: epahomov/docker-spark
+        volumes:
+            - ./target/scala-2.11/news-trends-broadcast-assembly-1.0.jar:/jar-to-run.jar
+        command: /spark/bin/spark-submit /jar-to-run.jar
+        networks:
+            - shared-network
+    db:
+        image: mongo
+        restart: always
+        environment:
+            MONGO_INITDB_ROOT_USERNAME: root
+            MONGO_INITDB_ROOT_PASSWORD: example
+        networks:
+            - shared-network
+networks:
+    shared-network:
+        name: news-trends-shared-network
