@@ -19,7 +19,7 @@ First go to the ```news-trends-broadcast``` project (this one) and issue the fol
 sbt assembly
 ```
 
-It will create assembly jar. After that start containers using docker-compose:
+It will create the assembly jar. After that start containers using docker-compose:
 
 ```
 docker-compose up
