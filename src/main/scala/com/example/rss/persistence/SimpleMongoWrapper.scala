@@ -18,4 +18,6 @@ class SimpleMongoWrapper(mongoUri: String, dbName: String) extends Serializable 
   lazy val futureDB: Future[DefaultDB] = futureConnection.flatMap(_.database(dbName))
 
   def collection(name: String): Future[BSONCollection] = futureDB.map(_.collection(name))
+
+  def copy: SimpleMongoWrapper = new SimpleMongoWrapper(mongoUri, dbName)
 }

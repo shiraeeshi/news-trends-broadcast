@@ -1,15 +1,20 @@
 package com.example.rss
 
-import com.github.catalystcode.fortis.spark.streaming.rss.{RSSInputDStream, RSSEntry}
+import scala.concurrent.duration._
+import com.github.catalystcode.fortis.spark.streaming.rss.{RSSEntry, RSSInputDStream}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.storage.StorageLevel
 import org.apache.spark.broadcast.Broadcast
-import org.apache.spark.streaming.{Seconds, StreamingContext}
+import org.apache.spark.streaming.{Minutes, Seconds, StreamingContext}
 import org.apache.spark.{SparkConf, SparkContext}
-
 import com.example.rss.persistence.SimpleMongoWrapper
 import com.example.rss.model.NewsEntry
+import reactivemongo.api.commands.WriteResult
+import reactivemongo.bson.BSONDocument
+
+import scala.concurrent.{ExecutionContext, Future}
+import scala.util.{Success, Try}
 
 object RSSDemo {
   def main(args: Array[String]): Unit = {
@@ -51,11 +56,10 @@ object RSSDemo {
     val mongoUri = "mongodb://root:example@db:27017/test?authSource=admin"
     val mongo = new SimpleMongoWrapper(mongoUri, "news-db")
 
-    def newsInTrend(maybeNews: Option[RDD[RSSEntry]], maybeTrends: Option[Broadcast[Set[String]]]): Option[RDD[(RSSEntry, Set[String])]] =
+    def newsInTrend(maybeNews: Option[RDD[RSSEntry]], maybeTrends: Option[Set[String]]): Option[RDD[(RSSEntry, Set[String])]] =
       for {
         newsRDD <- maybeNews
-        trendsBroadcast <- maybeTrends
-        trends = trendsBroadcast.value
+        trends <- maybeTrends
       } yield {
         newsRDD map { entry =>
           (entry, trends.intersect(entry.title.split("\\s+").toSet))
@@ -65,60 +69,81 @@ object RSSDemo {
         }
       }
 
+    def transformToClose[T](f: Future[T])(closeFunc: () => Unit)(implicit executor: ExecutionContext): Future[Any] =
+      f.transform({_ => closeFunc()}, {t => closeFunc();t})
+
 
     def handleNewsInTrend(maybeNews: Option[RDD[(RSSEntry, Set[String])]]): Unit = maybeNews match {
       case Some(filtered) =>
         import scala.concurrent.ExecutionContext.Implicits.global
-        filtered.foreachPartition { partition =>
-          val newsCollectionFuture = mongo.collection("news")
-          partition foreach {
-            case (r: RSSEntry, tags: Set[String]) =>
-              println(s">>> filtered title: ${r.title}\ntags: $tags")
-              val newsEntry = NewsEntry(r.title, r.links.map(_.href).mkString(","), r.publishedDate.toString, tags.toSeq)
-              newsCollectionFuture.flatMap(_.insert(newsEntry)) onComplete { result =>
-                println(s"future insert done: $result")
+        val mongoInDriver = mongo.copy
+        val futureRemove: Future[WriteResult] = mongoInDriver.collection("news").flatMap(_.remove(BSONDocument()))
+        futureRemove onComplete {
+          case Success(writeResult) if writeResult.ok =>
+            filtered.foreachPartition { partition =>
+              partition foreach {
+                case (r: RSSEntry, tags: Set[String]) =>
+                  println(s">>> filtered title: ${r.title}\ntags: $tags")
+                  val newsEntry = NewsEntry(r.title, r.links.map(_.href).mkString(","), r.publishedDate, tags.toSeq)
+                  val mongoInPartition = mongo.copy
+                  val newsCollectionFuture = mongoInPartition.collection("news")
+                  val futureInsert = newsCollectionFuture.flatMap(_.insert(newsEntry))
+                  futureInsert onComplete { result =>
+                    println(s"future insert done: $result")
+                    mongoInPartition.futureConnection.foreach(_.askClose()(10.seconds))
+                  }
+                  transformToClose(futureInsert) { () =>
+                    mongoInPartition.futureConnection foreach { conn =>
+                      conn.askClose()(10.seconds)
+                    }
+                  }
               }
+            }
+        }
+        transformToClose(futureRemove) { () =>
+          mongoInDriver.futureConnection foreach { conn =>
+            conn.askClose()(10.seconds)
           }
         }
       case None =>
         println(">>> filtered is none")
     }
 
-    newsStream foreachRDD { rdd =>
+    newsStream.window(Minutes(60), Seconds(30)) foreachRDD { rdd =>
       lastRDD = Some(rdd)
-      val spark = SparkSession.builder.appName(sc.appName).getOrCreate()
-      import spark.sqlContext.implicits._
-      rdd.toDS().show()
-      rdd.foreach { r =>
-        println(s"~~~ title: ${r.title}")
-      }
-      println(s"^^^ trends broadcast: $trendsBroadcast")
-      trendsBroadcast match {
-        case Some(b) => println(s"^^^ trends: ${b.value}")
-        case _ => ()
-      }
-      val maybeFiltered = newsInTrend(lastRDD, trendsBroadcast)
-      handleNewsInTrend(maybeFiltered)
+//      val spark = SparkSession.builder.appName(sc.appName).getOrCreate()
+//      import spark.sqlContext.implicits._
+//      rdd.toDS().show()
+//      rdd.foreach { r =>
+//        println(s"~~~ title: ${r.title}")
+//      }
+//      println(s"^^^ trends broadcast: $trendsBroadcast")
+//      trendsBroadcast match {
+//        case Some(b) => println(s"^^^ trends: ${b.value}")
+//        case _ => ()
+//      }
+//      val maybeFiltered = newsInTrend(lastRDD, trendsBroadcast.map(_.value))
+//      handleNewsInTrend(maybeFiltered)
     }
 
     val trendsStream = new RSSInputDStream(Array("https://trends.google.com/trends/trendingsearches/daily/rss?geo=US"), Map(
       "User-Agent" -> "Mozilla/5.0 (Windows NT 6.1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/41.0.2228.0 Safari/537.36"
       ), ssc, StorageLevel.MEMORY_ONLY, pollingPeriodInSeconds = durationSeconds)
 
-    trendsStream foreachRDD { rdd =>
+
+    trendsStream.window(Minutes(60), Seconds(30)) foreachRDD { rdd =>
       val spark = SparkSession.builder.appName(sc.appName).getOrCreate()
       import spark.sqlContext.implicits._
       rdd.toDS().show()
       if (!rdd.isEmpty) {
-        trendsBroadcast = Some(sc.broadcast(
-          rdd
+        val trendsSet = rdd
             .collect()
             .flatMap(_.title.split("\\s+")
-            .map(_.filter(",.:'!\"@#$%^&*()".indexOf(_) < 0)))
+              .map(_.filterNot(",.:'!\"@#$%^&*()".contains(_))))
             .filterNot(Set("on", "in", "and", "vs", "to", "about").contains)
             .toSet
-          ))
-        val maybeFiltered = newsInTrend(lastRDD, trendsBroadcast)
+        trendsBroadcast = Some(sc.broadcast(trendsSet))
+        val maybeFiltered = newsInTrend(lastRDD, trendsBroadcast.map(_.value))
         handleNewsInTrend(maybeFiltered)
       }
     }
